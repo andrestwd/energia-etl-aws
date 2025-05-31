@@ -150,3 +150,6 @@ Aunque actualmente la ejecución es **manual (on demand)**, este pipeline puede 
 
 - Andrés agudelo
 - Prueba técnica - Evaluación para ingeniería de datos
+
+
+
