@@ -1,0 +1,160 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Data Lake pipeline using S3, Glue, Athena, and Redshift - CloudFormation Template'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - qa
+      - prod
+
+Resources:
+  ### S3 Buckets ###
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "energy-datalake-raw-${Environment}"
+      VersioningConfiguration:
+        Status: Enabled
+
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "energy-datalake-processed-${Environment}"
+      VersioningConfiguration:
+        Status: Enabled
+
+  ### Glue Database ###
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref "AWS::AccountId"
+      DatabaseInput:
+        Name: !Sub "energy_datalake_db_${Environment}"
+
+  ### Glue Crawler ###
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "energy-datalake-crawler-${Environment}"
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${RawBucket}/"
+      Schedule:
+        ScheduleExpression: "cron(0 * * * ? *)" # hourly
+
+  ### Glue Service Role ###
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "AWSGlueServiceRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueS3AccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub "arn:aws:s3:::${RawBucket}/*"
+                  - !Sub "arn:aws:s3:::${ProcessedBucket}/*"
+
+  ### Glue Job - Transformación ###
+  GlueTransformJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "transform-energy-data-${Environment}"
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${RawBucket}/scripts/transform_script.py"
+        PythonVersion: 3
+      DefaultArguments:
+        --TempDir: !Sub "s3://${RawBucket}/tmp/"
+        --job-language: python
+        --enable-metrics: "true"
+      GlueVersion: "3.0"
+      NumberOfWorkers: 2
+      WorkerType: G.1X
+
+  ### Athena WorkGroup ###
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "energy_athena_${Environment}"
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${ProcessedBucket}/athena-results/"
+
+  ### Redshift Cluster ###
+  RedshiftCluster:
+    Type: AWS::Redshift::Cluster
+    Properties:
+      ClusterType: single-node
+      DBName: energydw
+      MasterUsername: masteruser
+      MasterUserPassword: MasterPass123!
+      NodeType: dc2.large
+      PubliclyAccessible: true
+      ClusterIdentifier: !Sub "energy-redshift-${Environment}"
+      IamRoles:
+        - !GetAtt RedshiftRole.Arn
+
+  RedshiftRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "RedshiftS3Access-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: redshift.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RedshiftS3ReadAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${ProcessedBucket}/*"
+
+Outputs:
+  RawBucketName:
+    Value: !Ref RawBucket
+    Description: S3 Bucket for raw data
+
+  ProcessedBucketName:
+    Value: !Ref ProcessedBucket
+    Description: S3 Bucket for processed data
+
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase
+    Description: Glue database name
+
+  AthenaWorkGroupName:
+    Value: !Ref AthenaWorkGroup
+    Description: Athena workgroup name
+
+  RedshiftClusterIdentifier:
+    Value: !Ref RedshiftCluster
+    Description: Redshift cluster identifier
