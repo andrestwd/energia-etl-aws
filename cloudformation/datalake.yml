@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Data Lake pipeline using S3, Glue, Athena, and Redshift - CloudFormation Template'
+Description: 'Pipeline de Data Lake utilizando S3, Glue, Athena, Redshift y Step Functions - Plantilla CloudFormation'
 
 Parameters:
   Environment:
@@ -11,7 +11,7 @@ Parameters:
       - prod
 
 Resources:
-  ### S3 Buckets ###
+  ### Buckets S3 con Capas ###
   RawBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -26,7 +26,7 @@ Resources:
       VersioningConfiguration:
         Status: Enabled
 
-  ### Glue Database ###
+  ### Base de Datos Glue ###
   GlueDatabase:
     Type: AWS::Glue::Database
     Properties:
@@ -34,20 +34,32 @@ Resources:
       DatabaseInput:
         Name: !Sub "energy_datalake_db_${Environment}"
 
-  ### Glue Crawler ###
-  GlueCrawler:
+  ### Crawler de Glue para Detección Automática de Esquemas ###
+  RawDataCrawler:
     Type: AWS::Glue::Crawler
     Properties:
-      Name: !Sub "energy-datalake-crawler-${Environment}"
+      Name: !Sub "raw-data-crawler-${Environment}"
       Role: !GetAtt GlueServiceRole.Arn
       DatabaseName: !Ref GlueDatabase
       Targets:
         S3Targets:
           - Path: !Sub "s3://${RawBucket}/"
       Schedule:
-        ScheduleExpression: "cron(0 * * * ? *)" # hourly
+        ScheduleExpression: "cron(0 0 * * ? *)" # Diario
 
-  ### Glue Service Role ###
+  ProcessedDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "processed-data-crawler-${Environment}"
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${ProcessedBucket}/"
+      Schedule:
+        ScheduleExpression: "cron(0 1 * * ? *)" # Diario
+
+  ### Rol de Servicio para Glue ###
   GlueServiceRole:
     Type: AWS::IAM::Role
     Properties:
@@ -73,7 +85,7 @@ Resources:
                   - !Sub "arn:aws:s3:::${RawBucket}/*"
                   - !Sub "arn:aws:s3:::${ProcessedBucket}/*"
 
-  ### Glue Job - Transformación ###
+  ### Trabajo de Glue - Transformación ###
   GlueTransformJob:
     Type: AWS::Glue::Job
     Properties:
@@ -91,7 +103,7 @@ Resources:
       NumberOfWorkers: 2
       WorkerType: G.1X
 
-  ### Athena WorkGroup ###
+  ### Grupo de Trabajo Athena ###
   AthenaWorkGroup:
     Type: AWS::Athena::WorkGroup
     Properties:
@@ -102,7 +114,7 @@ Resources:
         ResultConfiguration:
           OutputLocation: !Sub "s3://${ProcessedBucket}/athena-results/"
 
-  ### Redshift Cluster ###
+  ### Clúster Redshift ###
   RedshiftCluster:
     Type: AWS::Redshift::Cluster
     Properties:
@@ -138,23 +150,255 @@ Resources:
                 Resource:
                   - !Sub "arn:aws:s3:::${ProcessedBucket}/*"
 
+  ### Creación de Tablas en Redshift ###
+  RedshiftTableSetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "redshift-table-setup-${Environment}"
+      Runtime: python3.9
+      Handler: create_redshift_tables.handler
+      Role: arn:aws:iam::123456789012:role/service-role/AWSLambdaBasicExecutionRole
+      Code:
+        S3Bucket: !Ref RawBucket
+        S3Key: scripts/create_redshift_tables.zip
+      Timeout: 300
+
+  RedshiftTableSetupCustomResource:
+    Type: Custom::RedshiftTableSetup
+    Properties:
+      ServiceToken: !GetAtt RedshiftTableSetupFunction.Arn
+      ClusterIdentifier: !Ref RedshiftCluster
+      DatabaseName: energydw
+      DbUser: masteruser
+      Tables:
+        - Name: clientes
+          Schema: |
+            CREATE TABLE IF NOT EXISTS clientes (
+              tipo_id VARCHAR(20),
+              identificacion VARCHAR(50) PRIMARY KEY,
+              nombre VARCHAR(100),
+              ciudad VARCHAR(50),
+              fecha_carga DATE
+            );
+        - Name: proveedores
+          Schema: |
+            CREATE TABLE IF NOT EXISTS proveedores (
+              nombre_proveedor VARCHAR(100) PRIMARY KEY,
+              tipo_energia VARCHAR(50),
+              fecha_carga DATE
+            );
+        - Name: transacciones
+          Schema: |
+            CREATE TABLE IF NOT EXISTS transacciones (
+              tipo_transaccion VARCHAR(20),
+              nombre_cliente_proveedor VARCHAR(100),
+              cantidad_comprada REAL,
+              precio REAL,
+              tipo_energia VARCHAR(50),
+              total REAL,
+              fecha_carga DATE
+            );
+
+  ### Configuración de Lake Formation ###
+  LakeFormationSettings:
+    Type: AWS::LakeFormation::DataLakeSettings
+    Properties:
+      Admins:
+        - DataLakePrincipalIdentifier: !Sub "arn:aws:iam::${AWS::AccountId}:role/LakeFormationAdmin"
+
+  ### Permisos de Lake Formation ###
+  DataLocationPermission:
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !Sub "arn:aws:iam::${AWS::AccountId}:role/LakeFormationAdmin"
+      Resource:
+        DataLocation:
+          S3Resource: !Sub "arn:aws:s3:::${RawBucket}"
+      Permissions:
+        - DATA_LOCATION_ACCESS
+
+  ProcessedDataLocationPermission:
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !Sub "arn:aws:iam::${AWS::AccountId}:role/LakeFormationAdmin"
+      Resource:
+        DataLocation:
+          S3Resource: !Sub "arn:aws:s3:::${ProcessedBucket}"
+      Permissions:
+        - DATA_LOCATION_ACCESS
+
+  GlueDatabasePermission:
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !Sub "arn:aws:iam::${AWS::AccountId}:role/LakeFormationAdmin"
+      Resource:
+        Database:
+          Name: !Ref GlueDatabase
+      Permissions:
+        - ALL
+
+  ### Otorgar Permisos al Grupo de Trabajo Athena ###
+  AthenaWorkGroupPermission:
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !Sub "arn:aws:iam::${AWS::AccountId}:role/AthenaQueryRole"
+      Resource:
+        Database:
+          Name: !Ref GlueDatabase
+      Permissions:
+        - SELECT
+        - DESCRIBE
+
+  ### Máquina de Estados de Step Functions ###
+  StepFunctionStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "etl-pipeline-${Environment}"
+      RoleArn: !GetAtt StepFunctionExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "StartAt": "CargarClientesRedshift",
+          "States": {
+            "CargarClientesRedshift": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": !Sub "load_clientes_s3_to_redshift-${Environment}"
+              },
+              "Next": "CargarProveedoresRedshift"
+            },
+            "CargarProveedoresRedshift": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": !Sub "load_proveedores_s3_to_redshift-${Environment}"
+              },
+              "Next": "CargarTransaccionesRedshift"
+            },
+            "CargarTransaccionesRedshift": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": !Sub "load_transacciones_s3_to_redshift-${Environment}"
+              },
+              "End": true
+            }
+          }
+        }
+
+  ### Rol de Ejecución para Step Functions ###
+  StepFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "StepFunctionExecutionRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionGlueLambdaAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - lambda:InvokeFunction
+                Resource: "*"
+
+  ### Pipeline de Datos para Redshift ###
+  RedshiftDataPipeline:
+    Type: AWS::DataPipeline::Pipeline
+    Properties:
+      Name: !Sub "redshift-data-pipeline-${Environment}"
+      Description: "Pipeline para cargar datos procesados desde S3 a Redshift"
+      Activate: true
+      PipelineObjects:
+        - Id: "Default"
+          Name: "Default"
+          Fields:
+            - Key: "scheduleType"
+              StringValue: "cron"
+            - Key: "schedule"
+              RefValue: "Schedule"
+        - Id: "Schedule"
+          Name: "DailySchedule"
+          Fields:
+            - Key: "type"
+              StringValue: "Schedule"
+            - Key: "startDateTime"
+              StringValue: "2023-01-01T00:00:00"
+            - Key: "period"
+              StringValue: "1 day"
+        - Id: "RedshiftCopyActivity"
+          Name: "RedshiftCopyActivity"
+          Fields:
+            - Key: "type"
+              StringValue: "RedshiftCopyActivity"
+            - Key: "database"
+              StringValue: "energydw"
+            - Key: "table"
+              StringValue: "clientes"
+            - Key: "input"
+              RefValue: "S3Input"
+            - Key: "role"
+              StringValue: !Sub "arn:aws:iam::${AWS::AccountId}:role/RedshiftS3Access-${Environment}"
+        - Id: "S3Input"
+          Name: "S3Input"
+          Fields:
+            - Key: "type"
+              StringValue: "S3DataNode"
+            - Key: "directoryPath"
+              StringValue: !Sub "s3://${ProcessedBucket}/clientes/"
+
 Outputs:
   RawBucketName:
     Value: !Ref RawBucket
-    Description: S3 Bucket for raw data
+    Description: Bucket S3 para datos crudos
 
   ProcessedBucketName:
     Value: !Ref ProcessedBucket
-    Description: S3 Bucket for processed data
+    Description: Bucket S3 para datos procesados
 
   GlueDatabaseName:
     Value: !Ref GlueDatabase
-    Description: Glue database name
+    Description: Nombre de la base de datos Glue
 
   AthenaWorkGroupName:
     Value: !Ref AthenaWorkGroup
-    Description: Athena workgroup name
+    Description: Nombre del grupo de trabajo de Athena
 
   RedshiftClusterIdentifier:
     Value: !Ref RedshiftCluster
-    Description: Redshift cluster identifier
+    Description: Identificador del clúster de Redshift
+
+  LakeFormationAdminRole:
+    Value: !Sub "arn:aws:iam::${AWS::AccountId}:role/LakeFormationAdmin"
+    Description: "Rol IAM para el administrador de Lake Formation"
+
+  RawDataCrawlerName:
+    Value: !Ref RawDataCrawler
+    Description: "Crawler de Glue para datos crudos"
+
+  ProcessedDataCrawlerName:
+    Value: !Ref ProcessedDataCrawler
+    Description: "Crawler de Glue para datos procesados"
+
+  StepFunctionStateMachineArn:
+    Value: !Ref StepFunctionStateMachine
+    Description: "ARN de la máquina de estados de Step Functions"
+
+  RedshiftDataPipelineId:
+    Value: !Ref RedshiftDataPipeline
+    Description: "ID del pipeline de datos para Redshift"
+
+  RedshiftTableSetupFunctionArn:
+    Value: !GetAtt RedshiftTableSetupFunction.Arn
+    Description: "ARN de la función Lambda para crear tablas en Redshift"

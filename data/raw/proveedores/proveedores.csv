@@ -1,0 +1,6 @@
+nombre_proveedor,tipo_energia
+Proveedor Solar,Solar
+Proveedor Eólico,Eólica
+Proveedor Hidro,Hidroeléctrica
+Proveedor Nuclear,Nuclear
+Proveedor Mixto,Eólica
